@@ -43,7 +43,11 @@ python3 -m unittest discover -s tests -v
 ```
 
 The pipeline prints elapsed times for parsing/loading, validation,
-sessionization, attribution, aggregation, and Parquet writing to stderr.
+identity linking, sessionization, attribution, aggregation, and Parquet
+writing to stderr. Large event and click inputs are validated in parallel,
+using at most `NCPU` worker processes; smaller inputs avoid process startup.
+Record wall time as well as stage times and repeat runs on the same input,
+machine, and resource limits when comparing changes.
 For a native Windows benchmark, build the generator from the track page,
 then run these PowerShell commands from the starter directory:
 

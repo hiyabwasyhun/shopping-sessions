@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Build the Shopping Sessions daily tables with DuckDB."""
 
+import time
+
+PROCESS_STARTED = time.perf_counter()
+
 import csv
 import glob
 import json
+import multiprocessing
 import os
 import re
 import sys
 import tempfile
-import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 
 import duckdb
@@ -128,23 +133,70 @@ def write_rows(path, rows):
 
 
 def normalize_files(paths, column_count, output_path, require_first=False):
-    def rows():
+    field = r'(?:[^",]*|"[^",]*")'
+    valid_line = re.compile(field + ("," + field) * (column_count - 1))
+    max_line_size = 2_000_000
+    with open(output_path, "w", encoding="utf-8", newline="\n") as output:
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
         for path in paths:
-            for row in iter_csv_rows(path, column_count):
-                if not require_first or row[0] is not None:
-                    yield row
+            with open(path, "r", encoding="utf-8", newline="\n") as source:
+                next(source, None)
+                for raw_line in source:
+                    line = raw_line[:-1] if raw_line.endswith("\n") else raw_line
+                    if not line or valid_line.fullmatch(line) is None:
+                        continue
+                    if require_first and (line.startswith(",") or line.startswith('"",')):
+                        continue
+                    # UTF-8 uses at most four bytes per character.
+                    if len(line) > 400_000:
+                        max_line_size = max(
+                            max_line_size, len(line.encode("utf-8")) + 2 * column_count + 1
+                        )
+                    # DuckDB treats unquoted CR as a line ending, even with LF configured.
+                    if "\r" in line:
+                        fields = parse_csv_line(line)
+                        if fields is None:
+                            raise ValueError("CSV validator and parser disagree")
+                        writer.writerow(fields)
+                    else:
+                        output.write(line + "\n")
+    return max_line_size
 
-    write_rows(output_path, rows())
+
+def normalize_partition(args):
+    source, column_count, output, require_first = args
+    max_line_size = normalize_files([source], column_count, output, require_first)
+    return output, max_line_size
 
 
-def load_normalized(connection, table, path, columns):
+def normalize_partitions(paths, column_count, staging, prefix, require_first=False):
+    total_bytes = sum(os.path.getsize(path) for path in paths)
+    workers = min(NCPU, len(paths))
+    if workers < 2 or total_bytes < 32 * 1024 * 1024:
+        output = os.path.join(staging, prefix + ".csv")
+        max_line_size = normalize_files(paths, column_count, output, require_first)
+        return [output], max_line_size
+
+    tasks = [
+        (path, column_count, os.path.join(staging, f"{prefix}-{index}.csv"), require_first)
+        for index, path in enumerate(paths)
+    ]
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+    ) as executor:
+        results = list(executor.map(normalize_partition, tasks))
+    return [path for path, _ in results], max(size for _, size in results)
+
+
+def load_normalized(connection, table, path, columns, max_line_size=2_000_000):
     schema = ", ".join(f"{sql_string(column)}: 'VARCHAR'" for column in columns)
     connection.execute(
         f"""
         CREATE TEMP TABLE {table} AS
         SELECT * FROM read_csv(
             ?, auto_detect=false, header=false, columns={{{schema}}},
-            nullstr='', allow_quoted_nulls=true, new_line='\\n'
+            nullstr='', allow_quoted_nulls=true, new_line='\\n',
+            max_line_size={max_line_size}
         )
         """,
         [path],
@@ -152,7 +204,7 @@ def load_normalized(connection, table, path, columns):
 
 
 def main():
-    started = time.perf_counter()
+    started = PROCESS_STARTED
     previous = started
 
     def log_stage(name):
@@ -179,25 +231,32 @@ def main():
     connection.execute("SET preserve_insertion_order = false")
 
     os.makedirs(SCRATCH, exist_ok=True)
+    log_stage("startup and configuration")
     with tempfile.TemporaryDirectory(prefix="shopping_sessions_", dir=SCRATCH) as staging:
         user_ids = UserIds()
         for path in sorted(glob.glob(os.path.join(DATA, "links", "*.csv"))):
             for first, second in iter_csv_rows(path, 2):
                 if first is not None and second is not None:
                     user_ids.union(first, second)
+        log_stage("identity linking and link parsing")
         link_path = os.path.join(staging, "user_ids.csv")
+        link_line_size = 2_000_000
+        # A mapping row contains at most two IDs, each up to four bytes per character.
+        if max(map(len, user_ids.parent), default=0) > 200_000:
+            max_id_bytes = max(len(user_id.encode("utf-8")) for user_id in user_ids.parent)
+            link_line_size = max(link_line_size, 2 * max_id_bytes + 6)
         write_rows(link_path, ((user_id, user_ids.find(user_id)) for user_id in user_ids.parent))
-        load_normalized(connection, "user_ids", link_path, ["user_id", "person_id"])
+        load_normalized(connection, "user_ids", link_path, ["user_id", "person_id"], link_line_size)
         del user_ids
-        log_stage("links")
+        log_stage("identity mapping bulk load")
 
         for table, filename, columns in (
             ("products", "products.csv", ["product_id", "category"]),
             ("campaigns", "campaigns.csv", ["campaign_id", "channel"]),
         ):
             path = os.path.join(staging, table + ".csv")
-            normalize_files([os.path.join(DATA, filename)], len(columns), path)
-            load_normalized(connection, table, path, columns)
+            line_size = normalize_files([os.path.join(DATA, filename)], len(columns), path)
+            load_normalized(connection, table, path, columns, line_size)
         log_stage("dimensions")
 
         connection.execute(
@@ -226,16 +285,17 @@ def main():
             )
             """
         )
-        event_path = os.path.join(staging, "events.csv")
-        normalize_files(
+        event_paths, event_line_size = normalize_partitions(
             sorted(glob.glob(os.path.join(DATA, "events", "*.csv"))),
-            7, event_path, require_first=True,
+            7, staging, "events", require_first=True,
         )
+        log_stage("events CSV validation and staging")
         load_normalized(
-            connection, "event_raw", event_path,
+            connection, "event_raw", event_paths,
             ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
+            event_line_size,
         )
-        log_stage("events parse and bulk load")
+        log_stage("events bulk load")
 
         connection.execute(
             f"""
@@ -264,19 +324,21 @@ def main():
             """
         )
         connection.execute("DROP TABLE event_raw")
-        os.remove(event_path)
+        for path in event_paths:
+            os.remove(path)
         log_stage("events deduplication and validation")
 
-        click_path = os.path.join(staging, "clicks.csv")
-        normalize_files(
+        click_paths, click_line_size = normalize_partitions(
             sorted(glob.glob(os.path.join(DATA, "clicks", "*.csv"))),
-            4, click_path, require_first=True,
+            4, staging, "clicks", require_first=True,
         )
+        log_stage("clicks CSV validation and staging")
         load_normalized(
-            connection, "click_raw", click_path,
+            connection, "click_raw", click_paths,
             ["click_id", "user_id", "campaign_id", "ts"],
+            click_line_size,
         )
-        log_stage("clicks parse and bulk load")
+        log_stage("clicks bulk load")
 
         connection.execute(
             f"""
@@ -300,7 +362,8 @@ def main():
         )
         connection.execute("DROP TABLE click_raw")
         connection.execute("DROP TABLE user_ids")
-        os.remove(click_path)
+        for path in click_paths:
+            os.remove(path)
         log_stage("clicks deduplication and validation")
 
         connection.execute(
@@ -393,14 +456,11 @@ def main():
         connection.execute(
             f"""
             CREATE TEMP TABLE assisted_daily AS
-            WITH click_times AS (
-                SELECT DISTINCT person_id, campaign_id, ts_ms FROM clicks
-            ),
-            previous_click AS (
-                SELECT *, lag(ts_ms) OVER (
+            WITH previous_click AS (
+                SELECT person_id, campaign_id, ts_ms, lag(ts_ms) OVER (
                     PARTITION BY person_id, campaign_id ORDER BY ts_ms
                 ) AS previous_ts
-                FROM click_times
+                FROM clicks
             ),
             islands AS (
                 SELECT *, sum(
@@ -408,7 +468,7 @@ def main():
                          THEN 1 ELSE 0 END
                 ) OVER (
                     PARTITION BY person_id, campaign_id ORDER BY ts_ms
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                 ) AS island
                 FROM previous_click
             ),
@@ -488,6 +548,8 @@ def main():
                 f"{sql_string(os.path.join(output_dir, 'part-0.parquet'))} (FORMAT PARQUET)"
             )
         log_stage("write parquet")
+    connection.close()
+    log_stage("cleanup")
 
 
 if __name__ == "__main__":

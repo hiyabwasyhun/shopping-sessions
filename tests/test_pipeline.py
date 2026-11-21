@@ -14,6 +14,9 @@ import duckdb
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from pipeline.pipeline import load_normalized, normalize_files
+
 WEEK_MS = 604_800_000
 BASE_MS = 1_790_812_800_000  # 2026-10-01 00:00:00 UTC
 
@@ -26,6 +29,41 @@ def write_csv(path, header, rows):
 
 
 class PipelineRegressionTest(unittest.TestCase):
+    def test_bulk_csv_validation_and_normalization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first.csv"
+            second = root / "second.csv"
+            first.write_bytes(
+                b'a,b,c\n'
+                b'"a"," ", value \n'
+                b'x,,""\n'
+                b'car\rriage,end,tail\r\n'
+                b'"quoted\r",a,b\n'
+                b'"bad,comma",a,b\n'
+                b'bad"quote,a,b\n'
+                b'a,b\n'
+                b',a,b\n'
+                b'"",a,b\n'
+                b'no-newline,a,b'
+            )
+            second.write_bytes(b'a,b,c\nnext,a,b\n')
+            normalized = root / "normalized.csv"
+            normalize_files([first, second], 3, normalized, require_first=True)
+            db = duckdb.connect()
+            load_normalized(db, "rows", str(normalized), ["a", "b", "c"])
+            self.assertEqual(
+                db.execute("SELECT * FROM rows").fetchall(),
+                [
+                    ("a", " ", " value "),
+                    ("x", None, None),
+                    ("car\rriage", "end", "tail\r"),
+                    ("quoted\r", "a", "b"),
+                    ("no-newline", "a", "b"),
+                    ("next", "a", "b"),
+                ],
+            )
+
     def test_strict_csv_long_epoch_and_disjoint_assists(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -38,7 +76,10 @@ class PipelineRegressionTest(unittest.TestCase):
                 '"window_end":"2026-10-15T00:00:00Z"}',
                 encoding="utf-8",
             )
-            write_csv(data / "links" / "part.csv", ["user_id_a", "user_id_b"], [])
+            write_csv(
+                data / "links" / "part.csv", ["user_id_a", "user_id_b"],
+                [("a" * 1_000_100, "u1")],
+            )
             write_csv(data / "products.csv", ["product_id", "category"], [("p1", "books")])
             write_csv(data / "campaigns.csv", ["campaign_id", "channel"], [("c1", "search")])
             events_path = data / "events" / "part.csv"
@@ -46,7 +87,7 @@ class PipelineRegressionTest(unittest.TestCase):
             write_csv(
                 events_path,
                 ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
-                [(f"e{i}", "u1", "0" * 5000 + str(timestamp),
+                [(f"e{i}", "u1", "0" * (2_000_100 if i == 0 else 5000) + str(timestamp),
                   "2026-09-01T00:00:00Z", "view", "p1", "")
                  for i, timestamp in enumerate(times)],
             )
@@ -56,7 +97,9 @@ class PipelineRegressionTest(unittest.TestCase):
                 )
             write_csv(
                 data / "clicks" / "part.csv", ["click_id", "user_id", "campaign_id", "ts"],
-                [("a", "u1", "c1", BASE_MS), ("b", "u1", "c1", BASE_MS + WEEK_MS + 1)],
+                [("a", "u1", "c1", BASE_MS),
+                 ("b", "u1", "c1", BASE_MS + WEEK_MS + 1),
+                 ("c", "u1", "c1", BASE_MS + WEEK_MS + 1)],
             )
             env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(output),
                        SCRATCH_DIR=str(scratch), NCPU="4", MEM_GB="2")
@@ -116,6 +159,7 @@ class PipelineRegressionTest(unittest.TestCase):
             ]
             clicks.extend([
                 ("a", "u2", "c2", session_times[100]),
+                ("b", "u2", "c2", session_times[100]),
                 ("z", "u2", "c3", session_times[100]),
                 ("boundary", "u2", "c3", session_times[0] - WEEK_MS),
             ])
