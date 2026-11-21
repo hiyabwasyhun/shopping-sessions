@@ -39,7 +39,31 @@ To iterate without Docker:
 ```sh
 pip install duckdb==1.5.6
 python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+python3 -m unittest discover -s tests -v
 ```
+
+The pipeline prints elapsed times for parsing/loading, validation,
+sessionization, attribution, aggregation, and Parquet writing to stderr.
+For a native Windows benchmark, build the generator from the track page,
+then run these PowerShell commands from the starter directory:
+
+```powershell
+generate.exe --seed 1 --events 1000000 --clicks 250000 --output dev
+$env:DATA_DIR = (Resolve-Path .\dev).Path
+New-Item -ItemType Directory -Force .\out, .\scratch | Out-Null
+$env:OUTPUT_DIR = (Resolve-Path .\out).Path
+$env:SCRATCH_DIR = (Resolve-Path .\scratch).Path
+$env:NCPU = "8"
+$env:MEM_GB = "24"
+Measure-Command { python .\pipeline\pipeline.py }
+python .\scripts\compare.py .\out .\dev-answer
+```
+
+Extract `dev-answer.zip` from the track page in the starter directory so
+`dev-answer/user_daily.csv` exists before comparing.
+Use empty output and scratch directories for each run. Native timings are not
+scorer timings; also benchmark with Docker and the scorer resource limits before
+submitting.
 
 ## Submitting and scoring
 

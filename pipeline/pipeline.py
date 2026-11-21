@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Build the Shopping Sessions daily tables with DuckDB."""
 
+import csv
 import glob
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
 
 import duckdb
 
@@ -15,25 +19,17 @@ SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 NCPU = int(os.environ.get("NCPU", os.cpu_count() or 1))
 MEM_GB = int(os.environ.get("MEM_GB", "8"))
 
-EVENT_COLUMNS = 7
-CLICK_COLUMNS = 4
-LINK_COLUMNS = 2
 DAY_MS = 86_400_000
 SESSION_GAP_MS = 1_800_000
 CLICK_WINDOW_MS = 604_800_000
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
 F1_PATTERN = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z"
 )
-F2_PATTERN = re.compile(
-    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})([+-])([0-9]{2}):([0-9]{2})"
-)
-DIGITS_PATTERN = re.compile(r"[0-9]+")
 
 
 def parse_csv_line(line):
-    """Parse the challenge's restricted CSV dialect; return None if malformed."""
+    """Parse the restricted CSV dialect; return None if malformed."""
     if not line:
         return None
 
@@ -46,6 +42,8 @@ def parse_csv_line(line):
             if end < 0:
                 return None
             value = line[position + 1:end]
+            if "," in value:
+                return None
             position = end + 1
             if position < length and line[position] != ",":
                 return None
@@ -65,12 +63,11 @@ def parse_csv_line(line):
         if position == length:
             fields.append(None)
             break
-
     return fields
 
 
 def iter_csv_rows(path, expected_columns):
-    """Yield well-formed data rows, preserving carriage returns as field data."""
+    """Yield well-formed data rows, treating only LF as a line ending."""
     with open(path, "r", encoding="utf-8", newline="\n") as source:
         next(source, None)
         for raw_line in source:
@@ -80,53 +77,13 @@ def iter_csv_rows(path, expected_columns):
                 yield fields
 
 
-def parse_timestamp_ms(value):
-    """Parse the three allowed timestamp forms, returning None for invalid input."""
-    if value is None:
-        return None
-
+def manifest_timestamp_ms(value):
     match = F1_PATTERN.fullmatch(value)
-    offset_minutes = 0
     if match is None:
-        match = F2_PATTERN.fullmatch(value)
-        if match is None:
-            if DIGITS_PATTERN.fullmatch(value) is not None:
-                return int(value)
-            return None
-        sign = 1 if match.group(7) == "+" else -1
-        offset_hours = int(match.group(8))
-        offset_minute_part = int(match.group(9))
-        if offset_hours > 23 or offset_minute_part > 59:
-            return None
-        offset_minutes = sign * (offset_hours * 60 + offset_minute_part)
-
-    try:
-        timestamp = datetime(
-            int(match.group(1)),
-            int(match.group(2)),
-            int(match.group(3)),
-            int(match.group(4)),
-            int(match.group(5)),
-            int(match.group(6)),
-            tzinfo=timezone.utc,
-        )
-    except ValueError:
-        return None
-
-    timestamp -= timedelta(minutes=offset_minutes)
+        raise ValueError(f"invalid manifest timestamp: {value!r}")
+    timestamp = datetime(*(int(part) for part in match.groups()), tzinfo=timezone.utc)
     delta = timestamp - EPOCH
     return (delta.days * 86_400 + delta.seconds) * 1_000
-
-
-def parse_ingest_timestamp(value):
-    """Parse the always-valid F1 ingest timestamp, failing on a broken invariant."""
-    match = F1_PATTERN.fullmatch(value or "")
-    if match is None:
-        raise ValueError(f"invalid ingest_ts (expected F1): {value!r}")
-    timestamp_ms = parse_timestamp_ms(value)
-    if timestamp_ms is None:
-        raise ValueError(f"invalid ingest_ts (expected F1): {value!r}")
-    return timestamp_ms
 
 
 class UserIds:
@@ -139,11 +96,9 @@ class UserIds:
         if user_id not in self.parent:
             self.parent[user_id] = user_id
             return user_id
-
         root = user_id
         while self.parent[root] != root:
             root = self.parent[root]
-
         current = user_id
         while self.parent[current] != current:
             next_id = self.parent[current]
@@ -161,35 +116,60 @@ class UserIds:
         else:
             self.parent[first_root] = second_root
 
-    def person_name(self, user_id):
-        return self.find(user_id)
-
 
 def sql_string(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def insert_batches(connection, statement, rows, batch_size=10_000):
-    batch = []
-    for row in rows:
-        batch.append(row)
-        if len(batch) == batch_size:
-            connection.executemany(statement, batch)
-            batch.clear()
-    if batch:
-        connection.executemany(statement, batch)
+def write_rows(path, rows):
+    with open(path, "w", encoding="utf-8", newline="") as output:
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
+        writer.writerows(rows)
+
+
+def normalize_files(paths, column_count, output_path, require_first=False):
+    def rows():
+        for path in paths:
+            for row in iter_csv_rows(path, column_count):
+                if not require_first or row[0] is not None:
+                    yield row
+
+    write_rows(output_path, rows())
+
+
+def load_normalized(connection, table, path, columns):
+    schema = ", ".join(f"{sql_string(column)}: 'VARCHAR'" for column in columns)
+    connection.execute(
+        f"""
+        CREATE TEMP TABLE {table} AS
+        SELECT * FROM read_csv(
+            ?, auto_detect=false, header=false, columns={{{schema}}},
+            nullstr='', allow_quoted_nulls=true, new_line='\\n'
+        )
+        """,
+        [path],
+    )
 
 
 def main():
+    started = time.perf_counter()
+    previous = started
+
+    def log_stage(name):
+        nonlocal previous
+        now = time.perf_counter()
+        print(
+            f"{name}: {now - previous:.3f}s (total {now - started:.3f}s)",
+            file=sys.stderr,
+            flush=True,
+        )
+        previous = now
+
     with open(os.path.join(DATA, "manifest.json"), "r", encoding="utf-8") as source:
         manifest = json.load(source)
-    window_start_ms = parse_timestamp_ms(manifest["window_start"])
-    window_end_ms = parse_timestamp_ms(manifest["window_end"])
-    if (
-        window_start_ms is None
-        or window_end_ms is None
-        or window_start_ms >= window_end_ms
-    ):
+    window_start_ms = manifest_timestamp_ms(manifest["window_start"])
+    window_end_ms = manifest_timestamp_ms(manifest["window_end"])
+    if window_start_ms >= window_end_ms:
         raise ValueError("manifest must contain a valid, increasing time window")
 
     connection = duckdb.connect()
@@ -198,411 +178,316 @@ def main():
     connection.execute(f"SET temp_directory = {sql_string(os.path.join(SCRATCH, 'duckdb_tmp'))}")
     connection.execute("SET preserve_insertion_order = false")
 
-    print("window:", manifest["window_start"], "to", manifest["window_end"])
+    os.makedirs(SCRATCH, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="shopping_sessions_", dir=SCRATCH) as staging:
+        user_ids = UserIds()
+        for path in sorted(glob.glob(os.path.join(DATA, "links", "*.csv"))):
+            for first, second in iter_csv_rows(path, 2):
+                if first is not None and second is not None:
+                    user_ids.union(first, second)
+        link_path = os.path.join(staging, "user_ids.csv")
+        write_rows(link_path, ((user_id, user_ids.find(user_id)) for user_id in user_ids.parent))
+        load_normalized(connection, "user_ids", link_path, ["user_id", "person_id"])
+        del user_ids
+        log_stage("links")
 
-    user_ids = UserIds()
-    for path in sorted(glob.glob(os.path.join(DATA, "links", "*.csv"))):
-        for first, second in iter_csv_rows(path, LINK_COLUMNS):
-            if first is not None and second is not None:
-                user_ids.union(first, second)
+        for table, filename, columns in (
+            ("products", "products.csv", ["product_id", "category"]),
+            ("campaigns", "campaigns.csv", ["campaign_id", "channel"]),
+        ):
+            path = os.path.join(staging, table + ".csv")
+            normalize_files([os.path.join(DATA, filename)], len(columns), path)
+            load_normalized(connection, table, path, columns)
+        log_stage("dimensions")
 
-    connection.execute("CREATE TEMP TABLE products (product_id VARCHAR, category VARCHAR)")
-    product_rows = []
-    for product_id, category in iter_csv_rows(
-        os.path.join(DATA, "products.csv"), 2
-    ):
-        if product_id is not None:
-            product_rows.append((product_id, category))
-    if product_rows:
-        connection.executemany("INSERT INTO products VALUES (?, ?)", product_rows)
-
-    connection.execute("CREATE TEMP TABLE campaigns (campaign_id VARCHAR, channel VARCHAR)")
-    campaign_channels = {}
-    campaign_rows = []
-    for campaign_id, channel in iter_csv_rows(
-        os.path.join(DATA, "campaigns.csv"), 2
-    ):
-        if campaign_id is not None:
-            campaign_channels[campaign_id] = channel
-            campaign_rows.append((campaign_id, channel))
-    if campaign_rows:
-        connection.executemany("INSERT INTO campaigns VALUES (?, ?)", campaign_rows)
-
-    connection.execute(
-        """
-        CREATE TEMP TABLE event_raw (
-            event_id VARCHAR, user_id VARCHAR, ts VARCHAR, ingest_ms BIGINT,
-            event_type VARCHAR, product_id VARCHAR, price_cents VARCHAR
+        connection.execute(
+            """
+            CREATE MACRO timestamp_ms(value) AS (
+                CASE
+                    WHEN regexp_full_match(value, '[0-9]+') THEN
+                        try_cast(coalesce(nullif(ltrim(value, '0'), ''), '0') AS BIGINT)
+                    WHEN regexp_full_match(
+                        value,
+                        '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+                    ) AND substring(value, 1, 4) <> '0000' THEN
+                        epoch_ms(try_strptime(substring(value, 1, 19), '%Y-%m-%dT%H:%M:%S'))
+                    WHEN regexp_full_match(
+                        value,
+                        '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}'
+                    ) AND substring(value, 1, 4) <> '0000'
+                      AND try_cast(substring(value, 21, 2) AS INTEGER) <= 23
+                      AND try_cast(substring(value, 24, 2) AS INTEGER) <= 59 THEN
+                        epoch_ms(try_strptime(substring(value, 1, 19), '%Y-%m-%dT%H:%M:%S'))
+                        - CASE WHEN substring(value, 20, 1) = '+' THEN 1 ELSE -1 END
+                          * (try_cast(substring(value, 21, 2) AS INTEGER) * 60
+                             + try_cast(substring(value, 24, 2) AS INTEGER)) * 60000
+                    ELSE NULL
+                END
+            )
+            """
         )
-        """
-    )
-    event_insert = "INSERT INTO event_raw VALUES (?, ?, ?, ?, ?, ?, ?)"
-
-    def parsed_event_rows():
-        for path in sorted(glob.glob(os.path.join(DATA, "events", "*.csv"))):
-            for row in iter_csv_rows(path, EVENT_COLUMNS):
-                event_id, user_id, timestamp, ingest_ts, event_type, product_id, price = row
-                if event_id is None:
-                    continue
-                yield (
-                    event_id,
-                    user_id,
-                    timestamp,
-                    parse_ingest_timestamp(ingest_ts),
-                    event_type,
-                    product_id,
-                    price,
-                )
-
-    insert_batches(connection, event_insert, parsed_event_rows())
-    connection.execute(
-        """
-        CREATE TEMP TABLE event_dedup AS
-        SELECT event_id, user_id, ts, ingest_ms, event_type, product_id, price_cents
-        FROM event_raw
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY event_id ORDER BY ingest_ms
-        ) = 1
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE events (
-            person_id VARCHAR, ts_ms BIGINT, event_type VARCHAR,
-            product_id VARCHAR, price_cents BIGINT
+        event_path = os.path.join(staging, "events.csv")
+        normalize_files(
+            sorted(glob.glob(os.path.join(DATA, "events", "*.csv"))),
+            7, event_path, require_first=True,
         )
-        """
-    )
-
-    def validated_events():
-        cursor = connection.execute(
-            "SELECT user_id, ts, ingest_ms, event_type, product_id, price_cents "
-            "FROM event_dedup"
+        load_normalized(
+            connection, "event_raw", event_path,
+            ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],
         )
-        while True:
-            rows = cursor.fetchmany(10_000)
-            if not rows:
-                break
-            for user_id, timestamp, ingest_ms, event_type, product_id, price in rows:
-                if user_id is None or product_id is None:
-                    continue
-                if event_type not in ("view", "cart", "purchase"):
-                    continue
-                event_ms = parse_timestamp_ms(timestamp)
-                if (
-                    event_ms is None
-                    or event_ms < window_start_ms
-                    or event_ms >= window_end_ms
-                ):
-                    continue
-                if ingest_ms - event_ms > DAY_MS:
-                    continue
-                if event_type == "purchase":
-                    if price is None or DIGITS_PATTERN.fullmatch(price) is None:
-                        continue
-                    price_value = int(price)
-                    if price_value < 1 or price_value > 10_000_000:
-                        continue
-                else:
-                    price_value = 0
-                yield (
-                    user_ids.person_name(user_id),
-                    event_ms,
-                    event_type,
-                    product_id,
-                    price_value,
-                )
+        log_stage("events parse and bulk load")
 
-    insert_batches(
-        connection,
-        "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-        validated_events(),
-    )
-
-    connection.execute(
-        """
-        CREATE TEMP TABLE click_raw (
-            click_id VARCHAR, user_id VARCHAR, campaign_id VARCHAR, ts VARCHAR
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE events AS
+            WITH deduplicated AS (
+                SELECT * FROM event_raw
+                QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY ingest_ts) = 1
+            ),
+            parsed AS (
+                SELECT *, timestamp_ms(ts) AS ts_ms,
+                       CASE WHEN regexp_full_match(price_cents, '[0-9]+')
+                            THEN try_cast(coalesce(nullif(ltrim(price_cents, '0'), ''), '0') AS BIGINT)
+                       END AS price
+                FROM deduplicated
+                WHERE user_id IS NOT NULL AND product_id IS NOT NULL
+                  AND event_type IN ('view', 'cart', 'purchase')
+            )
+            SELECT coalesce(ids.person_id, e.user_id) AS person_id,
+                   e.ts_ms, e.event_type, e.product_id,
+                   CASE WHEN e.event_type = 'purchase' THEN e.price ELSE 0 END AS price_cents
+            FROM parsed e
+            LEFT JOIN user_ids ids ON ids.user_id = e.user_id
+            WHERE e.ts_ms >= {window_start_ms} AND e.ts_ms < {window_end_ms}
+              AND epoch_ms(strptime(e.ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) - e.ts_ms <= {DAY_MS}
+              AND (e.event_type <> 'purchase' OR e.price BETWEEN 1 AND 10000000)
+            """
         )
-        """
-    )
+        connection.execute("DROP TABLE event_raw")
+        os.remove(event_path)
+        log_stage("events deduplication and validation")
 
-    def parsed_click_rows():
-        for path in sorted(glob.glob(os.path.join(DATA, "clicks", "*.csv"))):
-            for click_id, user_id, campaign_id, timestamp in iter_csv_rows(
-                path, CLICK_COLUMNS
-            ):
-                if click_id is not None:
-                    yield (click_id, user_id, campaign_id, timestamp)
-
-    insert_batches(
-        connection,
-        "INSERT INTO click_raw VALUES (?, ?, ?, ?)",
-        parsed_click_rows(),
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE click_dedup AS
-        SELECT click_id, user_id, campaign_id, ts
-        FROM click_raw
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY click_id) = 1
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE clicks (
-            click_id VARCHAR, click_id_key BLOB, person_id VARCHAR,
-            campaign_id VARCHAR, ts_ms BIGINT
+        click_path = os.path.join(staging, "clicks.csv")
+        normalize_files(
+            sorted(glob.glob(os.path.join(DATA, "clicks", "*.csv"))),
+            4, click_path, require_first=True,
         )
-        """
-    )
-
-    def validated_clicks():
-        cursor = connection.execute(
-            "SELECT click_id, user_id, campaign_id, ts FROM click_dedup"
+        load_normalized(
+            connection, "click_raw", click_path,
+            ["click_id", "user_id", "campaign_id", "ts"],
         )
-        while True:
-            rows = cursor.fetchmany(10_000)
-            if not rows:
-                break
-            for click_id, user_id, campaign_id, timestamp in rows:
-                if (
-                    user_id is None
-                    or campaign_id not in campaign_channels
-                ):
-                    continue
-                click_ms = parse_timestamp_ms(timestamp)
-                if (
-                    click_ms is None
-                    or click_ms < window_start_ms - CLICK_WINDOW_MS
-                    or click_ms >= window_end_ms
-                ):
-                    continue
-                yield (
-                    click_id,
-                    click_id.encode("utf-8"),
-                    user_ids.person_name(user_id),
-                    campaign_id,
-                    click_ms,
-                )
+        log_stage("clicks parse and bulk load")
 
-    insert_batches(
-        connection,
-        "INSERT INTO clicks VALUES (?, ?, ?, ?, ?)",
-        validated_clicks(),
-    )
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE clicks AS
+            WITH deduplicated AS (
+                SELECT * FROM click_raw
+                QUALIFY row_number() OVER (PARTITION BY click_id) = 1
+            ),
+            parsed AS (
+                SELECT *, timestamp_ms(ts) AS ts_ms FROM deduplicated
+                WHERE user_id IS NOT NULL
+            )
+            SELECT c.click_id, coalesce(ids.person_id, c.user_id) AS person_id,
+                   c.campaign_id, c.ts_ms
+            FROM parsed c
+            JOIN campaigns campaigns ON campaigns.campaign_id = c.campaign_id
+            LEFT JOIN user_ids ids ON ids.user_id = c.user_id
+            WHERE c.ts_ms >= {window_start_ms - CLICK_WINDOW_MS}
+              AND c.ts_ms < {window_end_ms}
+            """
+        )
+        connection.execute("DROP TABLE click_raw")
+        connection.execute("DROP TABLE user_ids")
+        os.remove(click_path)
+        log_stage("clicks deduplication and validation")
 
-    connection.execute(
-        f"""
-        CREATE TEMP TABLE session_events AS
-        WITH ordered_events AS (
-            SELECT *,
-                   LAG(ts_ms) OVER (
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE session_events AS
+            WITH ordered AS (
+                SELECT *, lag(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms) AS previous_ts
+                FROM events
+            ),
+            boundaries AS (
+                SELECT *, CASE WHEN previous_ts IS NULL OR ts_ms - previous_ts > {SESSION_GAP_MS}
+                               THEN 1 ELSE 0 END AS starts_session
+                FROM ordered
+            )
+            SELECT person_id, ts_ms, event_type, product_id, price_cents,
+                   sum(starts_session) OVER (
                        PARTITION BY person_id ORDER BY ts_ms
-                   ) AS previous_ts_ms
-            FROM events
-        ),
-        session_boundaries AS (
-            SELECT *,
-                   CASE
-                       WHEN previous_ts_ms IS NULL
-                         OR ts_ms - previous_ts_ms > {SESSION_GAP_MS}
-                       THEN 1 ELSE 0
-                   END AS starts_session
-            FROM ordered_events
-        ),
-        numbered_events AS (
-            SELECT *,
-                   SUM(starts_session) OVER (
-                       PARTITION BY person_id ORDER BY ts_ms
-                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                    ) AS session_number
-            FROM session_boundaries
+            FROM boundaries
+            """
         )
-        SELECT person_id, ts_ms, event_type, product_id, price_cents,
-               session_number
-        FROM numbered_events
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE sessions AS
-        SELECT person_id, session_number,
-               MIN(ts_ms) AS session_start_ms,
-               CAST(epoch_ms(MIN(ts_ms)) AS DATE) AS day,
-               COUNT(*)::BIGINT AS event_count,
-               SUM(CASE WHEN event_type = 'purchase' THEN price_cents ELSE 0 END)::BIGINT
-                   AS revenue_cents,
-               SUM(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END)::BIGINT
-                   AS purchase_count
-        FROM session_events
-        GROUP BY person_id, session_number
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE category_daily AS
-        WITH category_totals AS (
-            SELECT s.person_id, s.day,
-                   COALESCE(p.category, 'unknown') AS category,
-                   SUM(e.price_cents)::BIGINT AS category_revenue
-            FROM session_events e
-            JOIN sessions s
-              ON s.person_id = e.person_id
-             AND s.session_number = e.session_number
-            LEFT JOIN products p ON p.product_id = e.product_id
-            WHERE e.event_type = 'purchase'
-            GROUP BY s.person_id, s.day, COALESCE(p.category, 'unknown')
-        ),
-        ranked_categories AS (
-            SELECT person_id, day, category,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY person_id, day
-                       ORDER BY category_revenue DESC, category ASC
-                   ) AS category_rank
-            FROM category_totals
+        connection.execute("DROP TABLE events")
+        connection.execute(
+            """
+            CREATE TEMP TABLE sessions AS
+            SELECT person_id, session_number, min(ts_ms) AS session_start_ms,
+                   cast(epoch_ms(min(ts_ms)) AS DATE) AS day,
+                   count(*)::BIGINT AS event_count,
+                   sum(price_cents)::BIGINT AS revenue_cents,
+                   count(*) FILTER (WHERE event_type = 'purchase')::BIGINT AS purchase_count
+            FROM session_events
+            GROUP BY person_id, session_number
+            """
         )
-        SELECT person_id, day, category
-        FROM ranked_categories
-        WHERE category_rank = 1
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE user_daily AS
-        SELECT daily.person_id AS user_id, daily.day,
-               daily.sessions, daily.events, daily.revenue_cents,
-               categories.category AS top_category
-        FROM (
-            SELECT person_id, day,
-                   COUNT(*)::BIGINT AS sessions,
-                   SUM(event_count)::BIGINT AS events,
-                   SUM(revenue_cents)::BIGINT AS revenue_cents
-            FROM sessions
-            GROUP BY person_id, day
-        ) daily
-        LEFT JOIN category_daily categories
-          ON categories.person_id = daily.person_id
-         AND categories.day = daily.day
-        """
-    )
+        log_stage("sessionization")
 
-    connection.execute(
-        f"""
-        CREATE TEMP TABLE session_credit AS
-        WITH eligible_clicks AS (
-            SELECT s.person_id, s.session_number, c.campaign_id,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY s.person_id, s.session_number
-                       ORDER BY c.ts_ms DESC, c.click_id_key ASC
-                   ) AS click_rank
-            FROM sessions s
-            JOIN clicks c
-              ON c.person_id = s.person_id
-             AND c.ts_ms <= s.session_start_ms
-             AND c.ts_ms >= s.session_start_ms - {CLICK_WINDOW_MS}
+        connection.execute(
+            """
+            CREATE TEMP TABLE user_daily AS
+            WITH category_totals AS (
+                SELECT s.person_id, s.day, coalesce(p.category, 'unknown') AS category,
+                       sum(e.price_cents) AS category_revenue
+                FROM session_events e
+                JOIN sessions s USING (person_id, session_number)
+                LEFT JOIN products p ON p.product_id = e.product_id
+                WHERE e.event_type = 'purchase'
+                GROUP BY s.person_id, s.day, coalesce(p.category, 'unknown')
+            ),
+            category_daily AS (
+                SELECT person_id, day, category
+                FROM category_totals
+                QUALIFY row_number() OVER (
+                    PARTITION BY person_id, day ORDER BY category_revenue DESC, category ASC
+                ) = 1
+            ),
+            daily AS (
+                SELECT person_id, day, count(*)::BIGINT AS sessions,
+                       sum(event_count)::BIGINT AS events,
+                       sum(revenue_cents)::BIGINT AS revenue_cents
+                FROM sessions GROUP BY person_id, day
+            )
+            SELECT d.person_id AS user_id, d.day, d.sessions, d.events, d.revenue_cents,
+                   c.category AS top_category
+            FROM daily d LEFT JOIN category_daily c USING (person_id, day)
+            """
         )
-        SELECT person_id, session_number, campaign_id
-        FROM eligible_clicks
-        WHERE click_rank = 1
-        """
-    )
-    connection.execute(
-        f"""
-        CREATE TEMP TABLE session_assists AS
-        SELECT DISTINCT s.person_id, s.session_number, c.campaign_id
-        FROM sessions s
-        JOIN clicks c
-          ON c.person_id = s.person_id
-         AND c.ts_ms <= s.session_start_ms
-         AND c.ts_ms >= s.session_start_ms - {CLICK_WINDOW_MS}
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE session_campaign AS
-        SELECT s.person_id, s.session_number, s.day, s.purchase_count,
-               s.revenue_cents, COALESCE(c.campaign_id, 'organic') AS campaign_id
-        FROM sessions s
-        LEFT JOIN session_credit c
-          ON c.person_id = s.person_id
-         AND c.session_number = s.session_number
-        """
-    )
-    connection.execute(
-        """
-        CREATE TEMP TABLE campaign_daily AS
-        WITH credited AS (
-            SELECT campaign_id, day,
-                   COUNT(*)::BIGINT AS sessions,
-                   SUM(CASE WHEN purchase_count > 0 THEN 1 ELSE 0 END)::BIGINT
-                       AS purchasing_sessions,
-                   SUM(revenue_cents)::BIGINT AS revenue_cents
-            FROM session_campaign
+        connection.execute("DROP TABLE session_events")
+        connection.execute("DROP TABLE products")
+        log_stage("user daily aggregation")
+
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE session_campaign AS
+            WITH click_at_time AS (
+                SELECT person_id, ts_ms, arg_min(campaign_id, click_id) AS campaign_id
+                FROM clicks GROUP BY person_id, ts_ms
+            )
+            SELECT s.person_id, s.session_number, s.day, s.purchase_count, s.revenue_cents,
+                   CASE WHEN c.ts_ms >= s.session_start_ms - {CLICK_WINDOW_MS}
+                        THEN c.campaign_id ELSE 'organic' END AS campaign_id
+            FROM sessions s ASOF LEFT JOIN click_at_time c
+              ON s.person_id = c.person_id AND s.session_start_ms >= c.ts_ms
+            """
+        )
+        log_stage("last-click attribution")
+
+        # Merge overlapping click-eligibility intervals, then count sessions in
+        # each interval via two prefix lookups instead of a session-click join.
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE assisted_daily AS
+            WITH click_times AS (
+                SELECT DISTINCT person_id, campaign_id, ts_ms FROM clicks
+            ),
+            previous_click AS (
+                SELECT *, lag(ts_ms) OVER (
+                    PARTITION BY person_id, campaign_id ORDER BY ts_ms
+                ) AS previous_ts
+                FROM click_times
+            ),
+            islands AS (
+                SELECT *, sum(
+                    CASE WHEN previous_ts IS NULL OR ts_ms - previous_ts > {CLICK_WINDOW_MS}
+                         THEN 1 ELSE 0 END
+                ) OVER (
+                    PARTITION BY person_id, campaign_id ORDER BY ts_ms
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS island
+                FROM previous_click
+            ),
+            intervals AS (
+                SELECT person_id, campaign_id, min(ts_ms) AS start_ms,
+                       max(ts_ms) + {CLICK_WINDOW_MS} AS end_ms
+                FROM islands GROUP BY person_id, campaign_id, island
+            ),
+            days AS (SELECT DISTINCT day FROM sessions),
+            daily_intervals AS (
+                SELECT i.person_id, i.campaign_id, d.day,
+                       greatest(i.start_ms, epoch_ms(d.day::TIMESTAMP)) AS start_ms,
+                       least(i.end_ms, epoch_ms(d.day::TIMESTAMP) + {DAY_MS} - 1) AS end_ms
+                FROM intervals i JOIN days d
+                  ON d.day BETWEEN cast(epoch_ms(i.start_ms) AS DATE)
+                               AND cast(epoch_ms(i.end_ms) AS DATE)
+            ),
+            session_points AS (
+                SELECT person_id, session_start_ms,
+                       row_number() OVER (PARTITION BY person_id ORDER BY session_start_ms) AS n
+                FROM sessions
+            ),
+            end_counts AS (
+                SELECT i.*, coalesce(s.n, 0) AS end_count
+                FROM daily_intervals i ASOF LEFT JOIN session_points s
+                  ON i.person_id = s.person_id AND i.end_ms >= s.session_start_ms
+            ),
+            interval_counts AS (
+                SELECT i.campaign_id, i.day, i.end_count - coalesce(s.n, 0) AS count
+                FROM end_counts i ASOF LEFT JOIN session_points s
+                  ON i.person_id = s.person_id AND i.start_ms > s.session_start_ms
+            )
+            SELECT campaign_id, day, sum(count)::BIGINT AS assisted_sessions
+            FROM interval_counts
             GROUP BY campaign_id, day
-        ),
-        assisted AS (
-            SELECT a.campaign_id, s.day,
-                   COUNT(*)::BIGINT AS assisted_sessions
-            FROM session_assists a
-            JOIN sessions s
-              ON s.person_id = a.person_id
-             AND s.session_number = a.session_number
-            GROUP BY a.campaign_id, s.day
-        ),
-        combined AS (
-            SELECT COALESCE(c.campaign_id, a.campaign_id) AS campaign_id,
-                   COALESCE(c.day, a.day) AS day,
-                   COALESCE(c.sessions, 0)::BIGINT AS sessions,
-                   COALESCE(c.purchasing_sessions, 0)::BIGINT AS purchasing_sessions,
-                   COALESCE(c.revenue_cents, 0)::BIGINT AS revenue_cents,
-                   COALESCE(a.assisted_sessions, 0)::BIGINT AS assisted_sessions
-            FROM credited c
-            FULL OUTER JOIN assisted a
-              ON a.campaign_id = c.campaign_id
-             AND a.day = c.day
+            HAVING sum(count) > 0
+            """
         )
-        SELECT combined.campaign_id,
-               COALESCE(campaigns.channel, 'organic') AS channel,
-               combined.day, combined.sessions,
-               combined.purchasing_sessions, combined.revenue_cents,
-               combined.assisted_sessions
-        FROM combined
-        LEFT JOIN campaigns USING (campaign_id)
-        """
-    )
+        connection.execute("DROP TABLE clicks")
+        connection.execute("DROP TABLE sessions")
+        log_stage("assist interval aggregation")
 
-    user_output = os.path.join(OUT, "user_daily")
-    campaign_output = os.path.join(OUT, "campaign_daily")
-    os.makedirs(user_output, exist_ok=True)
-    os.makedirs(campaign_output, exist_ok=True)
+        connection.execute(
+            """
+            CREATE TEMP TABLE campaign_daily AS
+            WITH credited AS (
+                SELECT campaign_id, day, count(*)::BIGINT AS sessions,
+                       count(*) FILTER (WHERE purchase_count > 0)::BIGINT AS purchasing_sessions,
+                       sum(revenue_cents)::BIGINT AS revenue_cents
+                FROM session_campaign GROUP BY campaign_id, day
+            ),
+            combined AS (
+                SELECT coalesce(c.campaign_id, a.campaign_id) AS campaign_id,
+                       coalesce(c.day, a.day) AS day,
+                       coalesce(c.sessions, 0)::BIGINT AS sessions,
+                       coalesce(c.purchasing_sessions, 0)::BIGINT AS purchasing_sessions,
+                       coalesce(c.revenue_cents, 0)::BIGINT AS revenue_cents,
+                       coalesce(a.assisted_sessions, 0)::BIGINT AS assisted_sessions
+                FROM credited c FULL OUTER JOIN assisted_daily a
+                  ON a.campaign_id = c.campaign_id AND a.day = c.day
+            )
+            SELECT c.campaign_id,
+                   CASE WHEN c.campaign_id = 'organic' THEN 'organic' ELSE campaigns.channel END AS channel,
+                   c.day, c.sessions, c.purchasing_sessions, c.revenue_cents, c.assisted_sessions
+            FROM combined c LEFT JOIN campaigns USING (campaign_id)
+            """
+        )
+        connection.execute("DROP TABLE session_campaign")
+        connection.execute("DROP TABLE assisted_daily")
+        log_stage("campaign daily aggregation")
 
-    connection.execute(
-        f"""
-        COPY (
-            SELECT user_id::VARCHAR AS user_id, day::DATE AS day,
-                   sessions::BIGINT AS sessions, events::BIGINT AS events,
-                   revenue_cents::BIGINT AS revenue_cents,
-                   top_category::VARCHAR AS top_category
-            FROM user_daily
-        ) TO {sql_string(os.path.join(user_output, 'part-0.parquet'))}
-          (FORMAT PARQUET)
-        """
-    )
-    connection.execute(
-        f"""
-        COPY (
-            SELECT campaign_id::VARCHAR AS campaign_id, channel::VARCHAR AS channel,
-                   day::DATE AS day, sessions::BIGINT AS sessions,
-                   purchasing_sessions::BIGINT AS purchasing_sessions,
-                   revenue_cents::BIGINT AS revenue_cents,
-                   assisted_sessions::BIGINT AS assisted_sessions
-            FROM campaign_daily
-        ) TO {sql_string(os.path.join(campaign_output, 'part-0.parquet'))}
-          (FORMAT PARQUET)
-        """
-    )
-    print("wrote user_daily and campaign_daily")
+        for table in ("user_daily", "campaign_daily"):
+            output_dir = os.path.join(OUT, table)
+            os.makedirs(output_dir, exist_ok=True)
+            connection.execute(
+                f"COPY (SELECT * FROM {table}) TO "
+                f"{sql_string(os.path.join(output_dir, 'part-0.parquet'))} (FORMAT PARQUET)"
+            )
+        log_stage("write parquet")
 
 
 if __name__ == "__main__":
